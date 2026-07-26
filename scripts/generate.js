@@ -83,16 +83,35 @@ async function buildCollectionParts(ids) {
 // sortParts() — which only knows title/release_date/popularity/vote_average
 // — sorts series catalogs correctly. Movie items already use those field
 // names natively, so they need no aliasing.
-async function buildKeywordParts(keywordIds, mediaType) {
+//
+// excludeGenres/excludeKeywords are applied here at generation time (pipe-
+// separated OR, same as the Worker's live-fetch buildExcludeParams()) since
+// a GitHub-backed catalog has no live TMDB connection to filter against —
+// the exclusion has to already be baked into the stored file. Changing a
+// GitHub-backed list's exclude filters only takes effect on the next
+// regenerate (Save or Refresh Catalogue), not immediately.
+function buildExcludeParams(excludeGenres, excludeKeywords) {
+  let qs = '';
+  if (Array.isArray(excludeGenres) && excludeGenres.length > 0) {
+    qs += `&without_genres=${encodeURIComponent([...new Set(excludeGenres)].join('|'))}`;
+  }
+  if (Array.isArray(excludeKeywords) && excludeKeywords.length > 0) {
+    qs += `&without_keywords=${encodeURIComponent([...new Set(excludeKeywords)].join('|'))}`;
+  }
+  return qs;
+}
+
+async function buildKeywordParts(keywordIds, mediaType, excludeGenres, excludeKeywords) {
   const endpoint = mediaType === 'series' ? '/discover/tv' : '/discover/movie';
   const keywordParam = [...new Set(keywordIds)].join(',');
   const maxPages = Math.ceil(MAX_ITEMS / 20);
+  const excludeQs = buildExcludeParams(excludeGenres, excludeKeywords);
 
   let items = [];
   let page = 1;
   let totalPages = 1;
   do {
-    const data = await tmdbFetch(`${endpoint}?with_keywords=${encodeURIComponent(keywordParam)}&sort_by=popularity.desc&page=${page}`);
+    const data = await tmdbFetch(`${endpoint}?with_keywords=${encodeURIComponent(keywordParam)}&sort_by=popularity.desc&page=${page}${excludeQs}`);
     const results = Array.isArray(data.results) ? data.results : [];
     items.push(...results);
     totalPages = Number.isFinite(data.total_pages) ? data.total_pages : page;
@@ -112,9 +131,31 @@ async function buildKeywordParts(keywordIds, mediaType) {
 }
 
 async function main() {
-  const config = await (await fetch(`${WORKER_ORIGIN.replace(/\/+$/, '')}/export-config`)).json();
+  const exportUrl = `${WORKER_ORIGIN.replace(/\/+$/, '')}/export-config`;
+  console.log(`Mode: ${MODE}`);
+  console.log(`Fetching config from: ${exportUrl}`);
+
+  const configRes = await fetch(exportUrl);
+  if (!configRes.ok) {
+    console.error(`/export-config returned HTTP ${configRes.status} — is WORKER_ORIGIN correct and is the Worker deployed with the /export-config route?`);
+    process.exit(1);
+  }
+  const config = await configRes.json();
   const collections = Array.isArray(config.collections) ? config.collections : [];
   const keywordLists = Array.isArray(config.keywordLists) ? config.keywordLists : [];
+
+  const githubCollections = collections.filter(c => c.source === 'github');
+  const githubKeywordLists = keywordLists.filter(k => k.source === 'github');
+
+  console.log(`Config has ${collections.length} collection(s)/group(s) total, ${githubCollections.length} marked source:"github".`);
+  console.log(`Config has ${keywordLists.length} keyword list(s) total, ${githubKeywordLists.length} marked source:"github".`);
+
+  if (githubCollections.length === 0 && githubKeywordLists.length === 0) {
+    console.log('\nNothing to generate — no entries have "source": "github" set yet.');
+    console.log('This is expected until you mark at least one list as GitHub-backed in /configure.');
+    console.log('Raw config for reference:');
+    console.log(JSON.stringify(config, null, 2));
+  }
 
   const wanted = new Set(); // every catalogId that should exist after this run
   const errors = [];
@@ -155,7 +196,7 @@ async function main() {
         continue;
       }
       try {
-        const parts = await buildKeywordParts(k.keywordIds, mediaType);
+        const parts = await buildKeywordParts(k.keywordIds, mediaType, k.excludeGenres, k.excludeKeywords);
         writeCatalogFile(catalogId, parts);
         console.log(`wrote ${catalogId} (${parts.length} items)`);
       } catch (e) {
