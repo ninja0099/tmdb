@@ -1,0 +1,68 @@
+name: Generate catalog data
+
+# Two ways in:
+#  - schedule: daily cron, always a full regenerate (freshness backstop)
+#  - workflow_dispatch: triggered by the Worker itself —
+#      mode=fill  -> only generate files that don't exist yet (new lists)
+#      mode=full  -> force regenerate everything (the "Refresh Catalogue"
+#                    button in /configure, or a manual run from this tab)
+on:
+  schedule:
+    - cron: '17 3 * * *'   # once a day; time chosen off-the-hour to avoid GitHub's peak-load minute
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'fill = only missing/new lists, full = regenerate everything'
+        required: false
+        default: 'fill'
+        type: choice
+        options:
+          - fill
+          - full
+
+permissions:
+  contents: write
+
+concurrency:
+  # Only one generation run at a time — if a save-triggered "fill" dispatch
+  # lands while the daily "full" cron is still running (or vice versa),
+  # queue it instead of racing two commits against the same branch.
+  group: generate-catalog-data
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate catalog data
+        env:
+          # Where the Worker's /export-config route lives — set this repo
+          # secret/variable to your deployed worker's origin, e.g.
+          # https://tmdb-collection.freepg0099.workers.dev
+          WORKER_ORIGIN: ${{ secrets.WORKER_ORIGIN }}
+          TMDB_READ_ACCESS_TOKEN: ${{ secrets.TMDB_READ_ACCESS_TOKEN }}
+          # schedule runs have no `inputs` context at all, hence the fallback
+          MODE: ${{ github.event.inputs.mode || 'full' }}
+        run: node scripts/generate.js
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: regenerate catalog data ($MODE)"
+            git push
+          fi
+        env:
+          MODE: ${{ github.event.inputs.mode || 'full' }}
