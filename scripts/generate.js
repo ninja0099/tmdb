@@ -8,11 +8,25 @@
 // Usage (env vars):
 //   WORKER_ORIGIN            e.g. https://tmdb-collection.freepg0099.workers.dev
 //   TMDB_READ_ACCESS_TOKEN   TMDB v4 read access token
-//   MODE                     'fill' (skip files that already exist) or
-//                             'full' (always regenerate) — defaults to 'full'
+//   MODE                     'fill' (only generate missing/changed lists) or
+//                             'full' (always regenerate everything) — defaults
+//                             to 'full'
+//
+// "fill" mode does NOT mean "only brand new lists" — it means "only lists
+// whose generation-relevant config has actually changed since they were last
+// generated." Each data file stores a sourceHash fingerprint of the inputs
+// that affect its content (member ids/keywords + exclude filters — NOT sort,
+// since sort is applied client-side by the Worker against the stored raw
+// parts, so a sort-only edit never needs a regenerate). A missing file has no
+// hash to match, so it's generated same as before; an existing file whose
+// current config hashes differently than what's stored is now ALSO
+// regenerated, not skipped — this is what makes "I added a keyword to an
+// existing list" or "I changed its exclude filters" actually take effect on
+// the next Save, instead of silently waiting for the next full regenerate.
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const WORKER_ORIGIN = process.env.WORKER_ORIGIN;
 const TMDB_TOKEN = process.env.TMDB_READ_ACCESS_TOKEN;
@@ -43,13 +57,33 @@ async function tmdbFetch(pathAndQuery) {
   return res.json();
 }
 
-function fileExists(catalogId) {
-  return fs.existsSync(path.join(DATA_DIR, `${catalogId}.json`));
+// Fingerprints exactly the inputs that change what gets fetched from TMDB.
+// Order-independent (sorts arrays before hashing) so re-adding the same
+// members in a different order, or the config round-tripping through
+// JSON in a different key order, doesn't produce a spurious "changed"
+// result and trigger a needless regenerate.
+function computeSourceHash(inputs) {
+  const normalized = JSON.stringify(inputs, (key, value) => {
+    if (Array.isArray(value)) return [...value].sort();
+    return value;
+  });
+  return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16);
 }
 
-function writeCatalogFile(catalogId, parts) {
+function readExistingHash(catalogId) {
+  const filePath = path.join(DATA_DIR, `${catalogId}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return data.sourceHash || null;
+  } catch (e) {
+    return null; // corrupt/unreadable file — treat as "no hash," so it regenerates
+  }
+}
+
+function writeCatalogFile(catalogId, parts, sourceHash) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  const payload = { catalogId, generatedAt: new Date().toISOString(), parts };
+  const payload = { catalogId, generatedAt: new Date().toISOString(), sourceHash, parts };
   fs.writeFileSync(path.join(DATA_DIR, `${catalogId}.json`), JSON.stringify(payload));
 }
 
@@ -103,7 +137,12 @@ function buildExcludeParams(excludeGenres, excludeKeywords) {
 
 async function buildKeywordParts(keywordIds, mediaType, excludeGenres, excludeKeywords) {
   const endpoint = mediaType === 'series' ? '/discover/tv' : '/discover/movie';
-  const keywordParam = [...new Set(keywordIds)].join(',');
+  // Pipe-separated (OR), not comma (AND) — TMDB's with_keywords treats
+  // commas as "must have ALL of these keywords," which returns zero results
+  // for almost any multi-keyword include list. Same fix as the Worker's own
+  // fetchDiscoverPage()/handlePreviewKeyword() — see worker.js for the full
+  // explanation.
+  const keywordParam = [...new Set(keywordIds)].join('|');
   const maxPages = Math.ceil(MAX_ITEMS / 20);
   const excludeQs = buildExcludeParams(excludeGenres, excludeKeywords);
 
@@ -167,13 +206,14 @@ async function main() {
     const ids = c.groupId ? c.ids : [c.id];
     wanted.add(catalogId);
 
-    if (MODE === 'fill' && fileExists(catalogId)) {
-      console.log(`skip (exists, fill mode): ${catalogId}`);
+    const sourceHash = computeSourceHash({ ids });
+    if (MODE === 'fill' && readExistingHash(catalogId) === sourceHash) {
+      console.log(`skip (unchanged, fill mode): ${catalogId}`);
       continue;
     }
     try {
       const parts = await buildCollectionParts(ids);
-      writeCatalogFile(catalogId, parts);
+      writeCatalogFile(catalogId, parts, sourceHash);
       console.log(`wrote ${catalogId} (${parts.length} items)`);
     } catch (e) {
       errors.push(`${catalogId}: ${e.message}`);
@@ -191,13 +231,22 @@ async function main() {
       const catalogId = `tmdb_keyword_${mediaType}_${k.keywordListId}`;
       wanted.add(catalogId);
 
-      if (MODE === 'fill' && fileExists(catalogId)) {
-        console.log(`skip (exists, fill mode): ${catalogId}`);
+      // mediaType is included so switching a list between movie/series/all
+      // also triggers a regenerate (different /discover endpoint entirely,
+      // not just a different filter on the same data).
+      const sourceHash = computeSourceHash({
+        keywordIds: k.keywordIds,
+        mediaType,
+        excludeGenres: k.excludeGenres || [],
+        excludeKeywords: k.excludeKeywords || [],
+      });
+      if (MODE === 'fill' && readExistingHash(catalogId) === sourceHash) {
+        console.log(`skip (unchanged, fill mode): ${catalogId}`);
         continue;
       }
       try {
         const parts = await buildKeywordParts(k.keywordIds, mediaType, k.excludeGenres, k.excludeKeywords);
-        writeCatalogFile(catalogId, parts);
+        writeCatalogFile(catalogId, parts, sourceHash);
         console.log(`wrote ${catalogId} (${parts.length} items)`);
       } catch (e) {
         errors.push(`${catalogId}: ${e.message}`);
