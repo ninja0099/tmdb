@@ -224,41 +224,103 @@ async function fetchCollectionIdSetOnce(collectionIds) {
   return idSet;
 }
 
+// Like fetchCollectionIdSetOnce but returns the raw parts[] (full movie
+// objects with title/release_date/popularity) — needed for OR-mode include
+// handling where the collection's parts are one of the OR'd sources and
+// have to be sorted alongside the /discover results.
+async function fetchCollectionPartsOnce(collectionIds) {
+  if (!collectionIds || collectionIds.length === 0) return [];
+  const uniqueIds = [...new Set(collectionIds)];
+  const results = await Promise.allSettled(uniqueIds.map(id => tmdbFetch(`/collection/${id}`)));
+  const parts = [];
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    if (Array.isArray(r.value.parts)) parts.push(...r.value.parts);
+  }
+  return parts;
+}
+
 async function buildDiscoverParts(entry, mediaType) {
   const endpoint = mediaType === 'series' ? '/discover/tv' : '/discover/movie';
-  const includeQs = buildDiscoverIncludeParams(entry, mediaType);
   const excludeQs = buildDiscoverExcludeParams(entry);
   const maxPages = Math.ceil(MAX_ITEMS / 20);
 
-  // Collection filters are movie-only (TMDB collections have no TV
-  // equivalent) — same rule as the Worker's fetchDiscoverFilteredPage().
+  // Mirrors the Worker's fetchDiscoverFilteredPage exactly — see that
+  // function for the full source/dedup rationale. The only differences:
+  // no KV cache here, and a hard MAX_ITEMS cap instead of skip/slice.
   const includeCollections = entry.includeCollections || [];
   const excludeCollections = entry.excludeCollections || [];
-  const hasCollectionFilter = mediaType !== 'series' && (includeCollections.length > 0 || excludeCollections.length > 0);
-  const [includeSet, excludeSet] = hasCollectionFilter
-    ? await Promise.all([fetchCollectionIdSetOnce(includeCollections), fetchCollectionIdSetOnce(excludeCollections)])
-    : [null, null];
+  const includeGenres = entry.includeGenres || [];
+  const includeKeywords = entry.includeKeywords || [];
+  const includeCompanies = entry.includeCompanies || [];
+  const includeReleaseTypes = entry.includeReleaseTypes || [];
 
-  function passesCollectionFilter(tmdbId) {
-    if (!hasCollectionFilter) return true;
-    if (includeSet && includeSet.size > 0 && !includeSet.has(tmdbId)) return false;
-    if (excludeSet && excludeSet.has(tmdbId)) return false;
-    return true;
+  const sources = [];
+  if (includeGenres.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}` });
+  }
+  if (includeKeywords.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}` });
+  }
+  if (includeCompanies.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}` });
+  }
+  if (mediaType !== 'series' && includeReleaseTypes.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}` });
+  }
+  if (mediaType !== 'series' && entry.includeMode === 'or' && includeCollections.length > 0) {
+    sources.push({ kind: 'collection', ids: includeCollections });
   }
 
-  let items = [];
-  let page = 1;
-  let totalPages = 1;
-  do {
-    const path = `${endpoint}?${includeQs.replace(/^&/, '')}&sort_by=popularity.desc&page=${page}${excludeQs}`;
-    const data = await tmdbFetch(path);
-    const results = Array.isArray(data.results) ? data.results : [];
-    for (const item of results) {
-      if (passesCollectionFilter(item.id)) items.push(item);
+  const andMode = entry.includeMode === 'and';
+  const allIncludeQs = andMode ? buildDiscoverIncludeParams(entry, mediaType) : null;
+
+  const dedup = new Map();
+  const excludeSet = await fetchCollectionIdSetOnce(excludeCollections);
+
+  if (andMode || sources.length === 0) {
+    let page = 1;
+    let totalPages = 1;
+    do {
+      const includeStr = andMode ? allIncludeQs.replace(/^&/, '') : '';
+      const path = `${endpoint}?${includeStr}&sort_by=popularity.desc&page=${page}${excludeQs}`;
+      const data = await tmdbFetch(path);
+      for (const item of (data.results || [])) if (!dedup.has(item.id)) dedup.set(item.id, item);
+      totalPages = Number.isFinite(data.total_pages) ? data.total_pages : page;
+      page++;
+    } while (page <= totalPages && page <= maxPages && dedup.size < MAX_ITEMS);
+  } else {
+    for (const src of sources) {
+      if (src.kind === 'collection') {
+        const parts = await fetchCollectionPartsOnce(src.ids);
+        for (const p of parts) if (!dedup.has(p.id)) dedup.set(p.id, p);
+      }
     }
-    totalPages = Number.isFinite(data.total_pages) ? data.total_pages : page;
-    page++;
-  } while (page <= totalPages && page <= maxPages && items.length < MAX_ITEMS);
+    const discoverSources = sources.filter(s => s.kind === 'discover');
+    let page = 1;
+    let totalPages = 1;
+    do {
+      const round = await Promise.all(discoverSources.map(src => {
+        const path = `${endpoint}?${src.qs.replace(/^&/, '')}&sort_by=popularity.desc&page=${page}${excludeQs}`;
+        return tmdbFetch(path);
+      }));
+      let maxTotal = page;
+      for (const data of round) {
+        maxTotal = Math.max(maxTotal, Number.isFinite(data.total_pages) ? data.total_pages : page);
+        for (const item of (data.results || [])) if (!dedup.has(item.id)) dedup.set(item.id, item);
+      }
+      totalPages = maxTotal;
+      page++;
+    } while (page <= totalPages && page <= maxPages && dedup.size < MAX_ITEMS);
+  }
+
+  let items = [...dedup.values()];
+  if (excludeSet.size > 0) items = items.filter(p => !excludeSet.has(p.id));
+
+  if (andMode && mediaType !== 'series' && includeCollections.length > 0) {
+    const includeSet = await fetchCollectionIdSetOnce(includeCollections);
+    if (includeSet.size > 0) items = items.filter(p => includeSet.has(p.id));
+  }
 
   items = items.slice(0, MAX_ITEMS);
 
@@ -378,6 +440,7 @@ async function main() {
 
       const sourceHash = computeSourceHash({
         mediaType,
+        includeMode: dl.includeMode || 'or',
         includeGenres: dl.includeGenres || [],
         excludeGenres: dl.excludeGenres || [],
         includeKeywords: dl.includeKeywords || [],
