@@ -216,7 +216,9 @@ function buildDiscoverIncludeParams(entry, mediaType) {
   if (includeKeywords.length > 0) qs += `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}`;
   if (includeCompanies.length > 0) qs += `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}`;
   if (mediaType !== 'series' && includeReleaseTypes.length > 0) {
-    qs += `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}`;
+    // TMDB: with_release_type "can be used in conjunction with region".
+    // region=US scopes to US-specific release types (matches Worker logic).
+    qs += `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}&region=US`;
   }
   return qs;
 }
@@ -283,7 +285,7 @@ async function buildDiscoverParts(entry, mediaType) {
   // user expectation — "DC movies that had a theatrical release" should
   // narrow, not OR-broaden to "any theatrical release".
   const releaseTypeQs = (mediaType !== 'series' && includeReleaseTypes.length > 0)
-    ? `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}`
+    ? `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}&region=US`
     : '';
 
   const sources = [];
