@@ -276,18 +276,25 @@ async function buildDiscoverParts(entry, mediaType) {
   const includeCompanies = entry.includeCompanies || [];
   const includeReleaseTypes = entry.includeReleaseTypes || [];
 
+  // includeReleaseTypes is intentionally NOT a separate OR source: it's a
+  // narrowing constraint (e.g. "Theatrical" should reduce matches, not
+  // explode them), so it gets AND'd into every discover source AND into
+  // AND-mode's combined call (via buildDiscoverIncludeParams). This matches
+  // user expectation — "DC movies that had a theatrical release" should
+  // narrow, not OR-broaden to "any theatrical release".
+  const releaseTypeQs = (mediaType !== 'series' && includeReleaseTypes.length > 0)
+    ? `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}`
+    : '';
+
   const sources = [];
   if (includeGenres.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}` });
+    sources.push({ kind: 'discover', qs: `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}${releaseTypeQs}` });
   }
   if (includeKeywords.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}` });
+    sources.push({ kind: 'discover', qs: `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}${releaseTypeQs}` });
   }
   if (includeCompanies.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}` });
-  }
-  if (mediaType !== 'series' && includeReleaseTypes.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}` });
+    sources.push({ kind: 'discover', qs: `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}${releaseTypeQs}` });
   }
   if (mediaType !== 'series' && entry.includeMode === 'or' && includeCollections.length > 0) {
     sources.push({ kind: 'collection', ids: includeCollections });
