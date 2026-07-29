@@ -33,7 +33,27 @@ const crypto = require('crypto');
 
 const WORKER_ORIGIN = process.env.WORKER_ORIGIN;
 const TMDB_TOKEN = process.env.TMDB_READ_ACCESS_TOKEN;
-const MODE = process.env.MODE === 'fill' ? 'fill' : 'full';
+const DEFAULT_SORT = 'release_asc';
+
+const SORT_BY_MOVIE = {
+  release_desc:    'primary_release_date.desc',
+  release_asc:     'primary_release_date.asc',
+  popularity_desc: 'popularity.desc',
+  vote_desc:       'vote_average.desc',
+  title_asc:       'original_title.asc',
+};
+const SORT_BY_TV = {
+  release_desc:    'first_air_date.desc',
+  release_asc:     'first_air_date.asc',
+  popularity_desc: 'popularity.desc',
+  vote_desc:       'vote_average.desc',
+  title_asc:       'popularity.desc',
+};
+
+function discoverSortBy(entry, mediaType) {
+  const sortMap = mediaType === 'series' ? SORT_BY_TV : SORT_BY_MOVIE;
+  return sortMap[entry.sort] || sortMap[DEFAULT_SORT];
+}
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const MAX_ITEMS = 500; // same cap the Worker's own keyword preview uses
 
@@ -283,7 +303,8 @@ async function buildDiscoverParts(entry, mediaType) {
     let totalPages = 1;
     do {
       const includeStr = andMode ? allIncludeQs.replace(/^&/, '') : '';
-      const path = `${endpoint}?${includeStr}&sort_by=popularity.desc&page=${page}${excludeQs}`;
+      const sortBy = discoverSortBy(entry, mediaType);
+      const path = `${endpoint}?${includeStr}&sort_by=${encodeURIComponent(sortBy)}&page=${page}${excludeQs}`;
       const data = await tmdbFetch(path);
       for (const item of (data.results || [])) if (!dedup.has(item.id)) dedup.set(item.id, item);
       totalPages = Number.isFinite(data.total_pages) ? data.total_pages : page;
@@ -301,7 +322,8 @@ async function buildDiscoverParts(entry, mediaType) {
     let totalPages = 1;
     do {
       const round = await Promise.all(discoverSources.map(src => {
-        const path = `${endpoint}?${src.qs.replace(/^&/, '')}&sort_by=popularity.desc&page=${page}${excludeQs}`;
+        const sortBy = discoverSortBy(entry, mediaType);
+        const path = `${endpoint}?${src.qs.replace(/^&/, '')}&sort_by=${encodeURIComponent(sortBy)}&page=${page}${excludeQs}`;
         return tmdbFetch(path);
       }));
       let maxTotal = page;
