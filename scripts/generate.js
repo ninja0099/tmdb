@@ -1,9 +1,12 @@
 // Generates static data/{catalogId}.json files for every GitHub-backed
-// catalog in the Worker's saved config. Mirrors the Worker's own
-// fetchMergedParts() / keyword-discover logic so what gets stored here is
-// exactly what a live TMDB fetch would have returned — the Worker's
-// sortParts()/skip-slice logic runs unchanged against whatever is in these
-// files, live or generated.
+// catalog in the Worker's saved config — TMDB collections, combined
+// (multi-collection) groups, keyword-based discover lists, and fully
+// custom multi-filter Discover lists (genre/keyword/company/release-type/
+// collection include+exclude). Mirrors the Worker's own fetchMergedParts()
+// / keyword-discover / discover-filter logic exactly so what gets stored
+// here is indistinguishable from what a live TMDB fetch would have
+// returned — the Worker's sortParts()/skip-slice logic runs unchanged
+// against whatever is in these files, live or generated.
 //
 // Usage (env vars):
 //   WORKER_ORIGIN            e.g. https://tmdb-collection.freepg0099.workers.dev
@@ -169,6 +172,106 @@ async function buildKeywordParts(keywordIds, mediaType, excludeGenres, excludeKe
   return items;
 }
 
+// ── Discover lists (4th Worker page) ────────────────────────────────────────
+// Mirrors the Worker's buildIncludeParams()/buildDiscoverExcludeParams()/
+// fetchDiscoverFilteredPage() exactly — every include/exclude id list joins
+// with a pipe (OR), Release Type and "part of collection" are movie-only
+// and silently omitted for series, and collection membership is a
+// post-filter (fetched separately, since TMDB's /discover has no native
+// "belongs to collection" parameter at all).
+//
+// Unlike the Worker (which caches a collection's member-id set in KV across
+// many separate requests), this script fetches each needed collection's
+// member ids fresh once per run — there's no persistent cache here, but
+// that's fine: this only runs once per scheduled/triggered generation, not
+// once per Stremio catalog request.
+function buildDiscoverIncludeParams(entry, mediaType) {
+  let qs = '';
+  const includeGenres = entry.includeGenres || [];
+  const includeKeywords = entry.includeKeywords || [];
+  const includeCompanies = entry.includeCompanies || [];
+  const includeReleaseTypes = entry.includeReleaseTypes || [];
+  if (includeGenres.length > 0) qs += `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}`;
+  if (includeKeywords.length > 0) qs += `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}`;
+  if (includeCompanies.length > 0) qs += `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}`;
+  if (mediaType !== 'series' && includeReleaseTypes.length > 0) {
+    qs += `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}`;
+  }
+  return qs;
+}
+
+function buildDiscoverExcludeParams(entry) {
+  let qs = '';
+  const excludeGenres = entry.excludeGenres || [];
+  const excludeKeywords = entry.excludeKeywords || [];
+  const excludeCompanies = entry.excludeCompanies || [];
+  if (excludeGenres.length > 0) qs += `&without_genres=${encodeURIComponent([...new Set(excludeGenres)].join('|'))}`;
+  if (excludeKeywords.length > 0) qs += `&without_keywords=${encodeURIComponent([...new Set(excludeKeywords)].join('|'))}`;
+  if (excludeCompanies.length > 0) qs += `&without_companies=${encodeURIComponent([...new Set(excludeCompanies)].join('|'))}`;
+  return qs;
+}
+
+async function fetchCollectionIdSetOnce(collectionIds) {
+  if (!collectionIds || collectionIds.length === 0) return new Set();
+  const uniqueIds = [...new Set(collectionIds)];
+  const results = await Promise.allSettled(uniqueIds.map(id => tmdbFetch(`/collection/${id}`)));
+  const idSet = new Set();
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    const parts = Array.isArray(r.value.parts) ? r.value.parts : [];
+    for (const p of parts) idSet.add(p.id);
+  }
+  return idSet;
+}
+
+async function buildDiscoverParts(entry, mediaType) {
+  const endpoint = mediaType === 'series' ? '/discover/tv' : '/discover/movie';
+  const includeQs = buildDiscoverIncludeParams(entry, mediaType);
+  const excludeQs = buildDiscoverExcludeParams(entry);
+  const maxPages = Math.ceil(MAX_ITEMS / 20);
+
+  // Collection filters are movie-only (TMDB collections have no TV
+  // equivalent) — same rule as the Worker's fetchDiscoverFilteredPage().
+  const includeCollections = entry.includeCollections || [];
+  const excludeCollections = entry.excludeCollections || [];
+  const hasCollectionFilter = mediaType !== 'series' && (includeCollections.length > 0 || excludeCollections.length > 0);
+  const [includeSet, excludeSet] = hasCollectionFilter
+    ? await Promise.all([fetchCollectionIdSetOnce(includeCollections), fetchCollectionIdSetOnce(excludeCollections)])
+    : [null, null];
+
+  function passesCollectionFilter(tmdbId) {
+    if (!hasCollectionFilter) return true;
+    if (includeSet && includeSet.size > 0 && !includeSet.has(tmdbId)) return false;
+    if (excludeSet && excludeSet.has(tmdbId)) return false;
+    return true;
+  }
+
+  let items = [];
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const path = `${endpoint}?${includeQs.replace(/^&/, '')}&sort_by=popularity.desc&page=${page}${excludeQs}`;
+    const data = await tmdbFetch(path);
+    const results = Array.isArray(data.results) ? data.results : [];
+    for (const item of results) {
+      if (passesCollectionFilter(item.id)) items.push(item);
+    }
+    totalPages = Number.isFinite(data.total_pages) ? data.total_pages : page;
+    page++;
+  } while (page <= totalPages && page <= maxPages && items.length < MAX_ITEMS);
+
+  items = items.slice(0, MAX_ITEMS);
+
+  if (mediaType === 'series') {
+    items = items.map(item => ({
+      ...item,
+      title: item.name,
+      release_date: item.first_air_date,
+    }));
+  }
+  return items;
+}
+
 async function main() {
   const exportUrl = `${WORKER_ORIGIN.replace(/\/+$/, '')}/export-config`;
   console.log(`Mode: ${MODE}`);
@@ -182,14 +285,17 @@ async function main() {
   const config = await configRes.json();
   const collections = Array.isArray(config.collections) ? config.collections : [];
   const keywordLists = Array.isArray(config.keywordLists) ? config.keywordLists : [];
+  const discoverLists = Array.isArray(config.discoverLists) ? config.discoverLists : [];
 
   const githubCollections = collections.filter(c => c.source === 'github');
   const githubKeywordLists = keywordLists.filter(k => k.source === 'github');
+  const githubDiscoverLists = discoverLists.filter(d => d.source === 'github');
 
   console.log(`Config has ${collections.length} collection(s)/group(s) total, ${githubCollections.length} marked source:"github".`);
   console.log(`Config has ${keywordLists.length} keyword list(s) total, ${githubKeywordLists.length} marked source:"github".`);
+  console.log(`Config has ${discoverLists.length} discover list(s) total, ${githubDiscoverLists.length} marked source:"github".`);
 
-  if (githubCollections.length === 0 && githubKeywordLists.length === 0) {
+  if (githubCollections.length === 0 && githubKeywordLists.length === 0 && githubDiscoverLists.length === 0) {
     console.log('\nNothing to generate — no entries have "source": "github" set yet.');
     console.log('This is expected until you mark at least one list as GitHub-backed in /configure.');
     console.log('Raw config for reference:');
@@ -246,6 +352,48 @@ async function main() {
       }
       try {
         const parts = await buildKeywordParts(k.keywordIds, mediaType, k.excludeGenres, k.excludeKeywords);
+        writeCatalogFile(catalogId, parts, sourceHash);
+        console.log(`wrote ${catalogId} (${parts.length} items)`);
+      } catch (e) {
+        errors.push(`${catalogId}: ${e.message}`);
+        console.error(`FAILED ${catalogId}: ${e.message}`);
+      }
+    }
+  }
+
+  // Discover lists (4th Worker page) — 'all' expands to two catalogs (movie
+  // + series), same as keyword lists. The source hash covers every filter
+  // field across all 5 dimensions plus mediaType (since switching movie/
+  // series/all changes which /discover endpoint is hit entirely) — but
+  // deliberately NOT sort, for the same reason as everywhere else in this
+  // script: sort is applied client-side by the Worker against the stored
+  // raw parts, so a sort-only edit never needs a regenerate.
+  for (const dl of discoverLists) {
+    if (dl.source !== 'github') continue;
+    const mediaTypes = dl.mediaType === 'all' ? ['movie', 'series'] : [dl.mediaType];
+
+    for (const mediaType of mediaTypes) {
+      const catalogId = `tmdb_discover_${mediaType}_${dl.discoverListId}`;
+      wanted.add(catalogId);
+
+      const sourceHash = computeSourceHash({
+        mediaType,
+        includeGenres: dl.includeGenres || [],
+        excludeGenres: dl.excludeGenres || [],
+        includeKeywords: dl.includeKeywords || [],
+        excludeKeywords: dl.excludeKeywords || [],
+        includeCompanies: dl.includeCompanies || [],
+        excludeCompanies: dl.excludeCompanies || [],
+        includeReleaseTypes: dl.includeReleaseTypes || [],
+        includeCollections: dl.includeCollections || [],
+        excludeCollections: dl.excludeCollections || [],
+      });
+      if (MODE === 'fill' && readExistingHash(catalogId) === sourceHash) {
+        console.log(`skip (unchanged, fill mode): ${catalogId}`);
+        continue;
+      }
+      try {
+        const parts = await buildDiscoverParts(dl, mediaType);
         writeCatalogFile(catalogId, parts, sourceHash);
         console.log(`wrote ${catalogId} (${parts.length} items)`);
       } catch (e) {

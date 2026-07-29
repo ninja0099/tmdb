@@ -3,7 +3,11 @@ name: Generate catalog data
 # Two ways in:
 #  - schedule: daily cron, always a full regenerate (freshness backstop)
 #  - workflow_dispatch: triggered by the Worker itself —
-#      mode=fill  -> only generate files that don't exist yet (new lists)
+#      mode=fill  -> only regenerate lists whose generation-relevant config
+#                    has actually changed since they were last generated
+#                    (new lists included, since a missing file has no
+#                    sourceHash to match — see generate.js for the full
+#                    fingerprinting explanation)
 #      mode=full  -> force regenerate everything (the "Refresh Catalogue"
 #                    button in /configure, or a manual run from this tab)
 on:
