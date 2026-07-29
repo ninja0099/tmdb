@@ -33,6 +33,7 @@ const crypto = require('crypto');
 
 const WORKER_ORIGIN = process.env.WORKER_ORIGIN;
 const TMDB_TOKEN = process.env.TMDB_READ_ACCESS_TOKEN;
+const MODE = process.env.MODE === 'fill' ? 'fill' : 'full';
 const DEFAULT_SORT = 'release_asc';
 
 const SORT_BY_MOVIE = {
