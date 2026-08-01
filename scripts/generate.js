@@ -194,7 +194,7 @@ async function buildKeywordParts(keywordIds, mediaType, excludeGenres, excludeKe
 }
 
 // ── Discover lists (4th Worker page) ────────────────────────────────────────
-// Mirrors the Worker's buildIncludeParams()/buildDiscoverExcludeParams()/
+// Mirrors the Worker's buildDiscoverSources()/buildDiscoverExcludeParams()/
 // fetchDiscoverFilteredPage() exactly — every include/exclude id list joins
 // with a pipe (OR), Release Type and "part of collection" are movie-only
 // and silently omitted for series, and collection membership is a
@@ -206,21 +206,74 @@ async function buildKeywordParts(keywordIds, mediaType, excludeGenres, excludeKe
 // member ids fresh once per run — there's no persistent cache here, but
 // that's fine: this only runs once per scheduled/triggered generation, not
 // once per Stremio catalog request.
-function buildDiscoverIncludeParams(entry, mediaType) {
-  let qs = '';
+// Builds the query-source plan for a Discover list under per-dimension
+// AND/OR (entry.includeModes: { genre, keyword, company, collection }).
+// Direct port of the Worker's buildDiscoverSources() — see that function's
+// comment (in worker.js) for the full mechanism explanation. Kept as an
+// exact mirror so a catalog generated here is indistinguishable from what
+// a live Worker fetch would have returned.
+//
+// Briefly: every dimension marked 'and' (and populated) is folded into one
+// shared "AND fragment" query-string, which then gets appended onto every
+// dimension marked 'or' (and populated) as its own independent /discover
+// source. If nothing is OR-marked, the AND fragment alone becomes the one
+// and only /discover query. Collection is handled separately (TMDB's
+// /collection/{id} takes no filter parameters, so it can never ride along
+// on a /discover query the way genre/keyword/company can) — 'or' fetches
+// its members directly as a source, 'and' post-filters the combined
+// results afterward, independent of what the other three dimensions do.
+// Release type has no entry in includeModes and always narrows (folded
+// into the AND fragment, or appended directly with no AND-fragment
+// contributor to fold into) — it's never a source, since "Theatrical"
+// should reduce matches, not act as a thing to OR in and broaden them.
+function buildDiscoverSources(entry, mediaType) {
   const includeGenres = entry.includeGenres || [];
   const includeKeywords = entry.includeKeywords || [];
   const includeCompanies = entry.includeCompanies || [];
   const includeReleaseTypes = entry.includeReleaseTypes || [];
-  if (includeGenres.length > 0) qs += `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}`;
-  if (includeKeywords.length > 0) qs += `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}`;
-  if (includeCompanies.length > 0) qs += `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}`;
-  if (mediaType !== 'series' && includeReleaseTypes.length > 0) {
-    // TMDB: with_release_type "can be used in conjunction with region".
-    // region=US scopes to US-specific release types (matches Worker logic).
-    qs += `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}&region=US`;
+  const includeCollections = entry.includeCollections || [];
+
+  const modes = entry.includeModes || {};
+  const isAnd = (dim) => modes[dim] !== 'or'; // unknown/missing dim name defaults to 'and', matching the Worker's migrateDiscoverEntry default
+
+  const releaseTypeQs = (mediaType !== 'series' && includeReleaseTypes.length > 0)
+    ? `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}&region=US`
+    : '';
+
+  let andQs = '';
+  if (isAnd('genre') && includeGenres.length > 0) {
+    andQs += `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}`;
   }
-  return qs;
+  if (isAnd('keyword') && includeKeywords.length > 0) {
+    andQs += `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}`;
+  }
+  if (isAnd('company') && includeCompanies.length > 0) {
+    andQs += `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}`;
+  }
+  andQs += releaseTypeQs;
+
+  const sources = [];
+  if (!isAnd('genre') && includeGenres.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}${andQs}` });
+  }
+  if (!isAnd('keyword') && includeKeywords.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}${andQs}` });
+  }
+  if (!isAnd('company') && includeCompanies.length > 0) {
+    sources.push({ kind: 'discover', qs: `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}${andQs}` });
+  }
+  if (mediaType !== 'series' && !isAnd('collection') && includeCollections.length > 0) {
+    sources.push({ kind: 'collection', ids: includeCollections });
+  }
+
+  const singleQueryMode = sources.length === 0;
+
+  return {
+    sources,
+    singleQueryMode,
+    singleQueryQs: andQs,
+    collectionIsPostFilter: mediaType !== 'series' && isAnd('collection') && includeCollections.length > 0,
+  };
 }
 
 function buildDiscoverExcludeParams(entry) {
@@ -268,51 +321,22 @@ async function buildDiscoverParts(entry, mediaType) {
   const excludeQs = buildDiscoverExcludeParams(entry);
   const maxPages = Math.ceil(MAX_ITEMS / 20);
 
-  // Mirrors the Worker's fetchDiscoverFilteredPage exactly — see that
-  // function for the full source/dedup rationale. The only differences:
-  // no KV cache here, and a hard MAX_ITEMS cap instead of skip/slice.
-  const includeCollections = entry.includeCollections || [];
+  // Mirrors the Worker's fetchDiscoverFilteredPage exactly — see
+  // buildDiscoverSources() for the full source/AND-fragment rationale. The
+  // only differences here: no KV cache, and a hard MAX_ITEMS cap instead
+  // of skip/slice.
   const excludeCollections = entry.excludeCollections || [];
-  const includeGenres = entry.includeGenres || [];
-  const includeKeywords = entry.includeKeywords || [];
-  const includeCompanies = entry.includeCompanies || [];
-  const includeReleaseTypes = entry.includeReleaseTypes || [];
-
-  // includeReleaseTypes is intentionally NOT a separate OR source: it's a
-  // narrowing constraint (e.g. "Theatrical" should reduce matches, not
-  // explode them), so it gets AND'd into every discover source AND into
-  // AND-mode's combined call (via buildDiscoverIncludeParams). This matches
-  // user expectation — "DC movies that had a theatrical release" should
-  // narrow, not OR-broaden to "any theatrical release".
-  const releaseTypeQs = (mediaType !== 'series' && includeReleaseTypes.length > 0)
-    ? `&with_release_type=${encodeURIComponent([...new Set(includeReleaseTypes)].join('|'))}&region=US`
-    : '';
-
-  const sources = [];
-  if (includeGenres.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_genres=${encodeURIComponent([...new Set(includeGenres)].join('|'))}${releaseTypeQs}` });
-  }
-  if (includeKeywords.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_keywords=${encodeURIComponent([...new Set(includeKeywords)].join('|'))}${releaseTypeQs}` });
-  }
-  if (includeCompanies.length > 0) {
-    sources.push({ kind: 'discover', qs: `&with_companies=${encodeURIComponent([...new Set(includeCompanies)].join('|'))}${releaseTypeQs}` });
-  }
-  if (mediaType !== 'series' && entry.includeMode === 'or' && includeCollections.length > 0) {
-    sources.push({ kind: 'collection', ids: includeCollections });
-  }
-
-  const andMode = entry.includeMode === 'and';
-  const allIncludeQs = andMode ? buildDiscoverIncludeParams(entry, mediaType) : null;
+  const includeCollections = entry.includeCollections || [];
+  const { sources, singleQueryMode, singleQueryQs, collectionIsPostFilter } = buildDiscoverSources(entry, mediaType);
 
   const dedup = new Map();
   const excludeSet = await fetchCollectionIdSetOnce(excludeCollections);
 
-  if (andMode || sources.length === 0) {
+  if (singleQueryMode) {
     let page = 1;
     let totalPages = 1;
     do {
-      const includeStr = andMode ? allIncludeQs.replace(/^&/, '') : '';
+      const includeStr = singleQueryQs.replace(/^&/, '');
       const sortBy = discoverSortBy(entry, mediaType);
       const path = `${endpoint}?${includeStr}&sort_by=${encodeURIComponent(sortBy)}&page=${page}${excludeQs}`;
       const data = await tmdbFetch(path);
@@ -349,7 +373,7 @@ async function buildDiscoverParts(entry, mediaType) {
   let items = [...dedup.values()];
   if (excludeSet.size > 0) items = items.filter(p => !excludeSet.has(p.id));
 
-  if (andMode && mediaType !== 'series' && includeCollections.length > 0) {
+  if (collectionIsPostFilter) {
     const includeSet = await fetchCollectionIdSetOnce(includeCollections);
     if (includeSet.size > 0) items = items.filter(p => includeSet.has(p.id));
   }
@@ -470,9 +494,19 @@ async function main() {
       const catalogId = `tmdb_discover_${mediaType}_${dl.discoverListId}`;
       wanted.add(catalogId);
 
+      const modes = dl.includeModes || {};
       const sourceHash = computeSourceHash({
         mediaType,
-        includeMode: dl.includeMode || 'or',
+        // Flattened into 4 explicitly-named fields rather than hashing the
+        // includeModes object directly — computeSourceHash only normalizes
+        // array order, not object key order, so two functionally-identical
+        // includeModes objects with keys in a different insertion order
+        // would otherwise hash differently and trigger a needless
+        // regenerate. Named fields sidestep that entirely.
+        includeModeGenre: modes.genre === 'or' ? 'or' : 'and',
+        includeModeKeyword: modes.keyword === 'or' ? 'or' : 'and',
+        includeModeCompany: modes.company === 'or' ? 'or' : 'and',
+        includeModeCollection: modes.collection === 'or' ? 'or' : 'and',
         includeGenres: dl.includeGenres || [],
         excludeGenres: dl.excludeGenres || [],
         includeKeywords: dl.includeKeywords || [],
