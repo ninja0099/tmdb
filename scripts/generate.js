@@ -266,6 +266,24 @@ function buildDiscoverSources(entry, mediaType) {
     sources.push({ kind: 'collection', ids: includeCollections });
   }
 
+  // BUG FIX (mirrors the identical fix in the Worker's buildDiscoverSources):
+  // the AND fragment (andQs) is only useful if it either (a) IS the whole
+  // query (singleQueryMode, handled below) or (b) rides along on a
+  // discover-kind OR source. If Collection is the ONLY populated OR-marked
+  // dimension, `sources` contains just a collection-kind entry — which
+  // can't carry a query string (TMDB's /collection/{id} takes no filter
+  // params) — so andQs would otherwise have nowhere to attach and its
+  // genre/keyword/company values would silently vanish from generated
+  // catalogs entirely. Gated on hasCollectionSource specifically — NOT
+  // just "no discover source yet" — since that's also (correctly) true
+  // whenever every populated dimension is AND-marked and `sources` is
+  // legitimately meant to stay empty for singleQueryMode below.
+  const hasDiscoverSource = sources.some(s => s.kind === 'discover');
+  const hasCollectionSource = sources.some(s => s.kind === 'collection');
+  if (andQs && hasCollectionSource && !hasDiscoverSource) {
+    sources.push({ kind: 'discover', qs: andQs });
+  }
+
   const singleQueryMode = sources.length === 0;
 
   return {
